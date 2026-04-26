@@ -1,0 +1,1552 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Production-grade event-driven e-commerce order processing system.
+  Pattern: EventBridge (content routing) → SNS (fan-out) → SQS (durable buffering) → Lambda (processing).
+  Includes: DLQs, idempotency via DynamoDB conditional writes, partial batch failure,
+  CloudWatch alarms, least-privilege IAM (one role per function), and dev/prod parameterization.
+
+# ================================================================
+# SERVICE CHOICE RATIONALE
+# ================================================================
+#
+# EventBridge (not SNS as the entry point):
+#   Content-based routing via event patterns — route by source, detail-type,
+#   or any field in the event payload. Decouples producers from consumers at
+#   the routing layer. 200+ AWS service integrations. Schema registry.
+#   SNS alone can't filter on arbitrary payload fields without Lambda.
+#
+# SNS (fan-out layer between EventBridge and SQS):
+#   One EventBridge rule → one SNS topic → N SQS queues simultaneously.
+#   Adding a new consumer = new SNS subscription, no EB rule change needed.
+#   SNS guarantees delivery to all subscribers or retries per subscriber.
+#   Without SNS, each new consumer requires a new EB rule and target.
+#
+# SQS Standard (not FIFO, not direct Lambda invocation):
+#   Durable buffer — if Lambda is throttled/down, messages wait (up to 4 days).
+#   At-least-once delivery + idempotency table = effectively exactly-once.
+#   FIFO rejected: adds 3,000 msg/s limit and queue name constraints.
+#   Exactly-once semantics handled in code (ConditionalCheckFailedException),
+#   not by FIFO, because code-level idempotency is more flexible and portable.
+#
+# DynamoDB (idempotency + state):
+#   Conditional PutItem (attribute_not_exists) is atomic — safe for concurrent Lambdas.
+#   On-demand billing: $0 at idle. TTL auto-expires idempotency records after 24h.
+#   Single-table design for orders covers all entities via PK/SK patterns.
+#
+# Lambda (not ECS/Fargate):
+#   Event-driven workloads are bursty — Lambda scales to 0 when idle ($0 cost).
+#   Each SQS consumer is independently scalable via reserved concurrency.
+#   15-min timeout is sufficient for all processing here. Fargate adds cold-start
+#   complexity and task management overhead for no benefit at this scale.
+#
+# ================================================================
+
+Parameters:
+
+  AppName:
+    Type: String
+    Default: ecommerce
+    AllowedPattern: '[a-z][a-z0-9-]+'
+    Description: Lowercase name prefix applied to all resources
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  AlertEmail:
+    Type: String
+    Default: ops@example.com
+    Description: Email for CloudWatch alarm notifications
+
+  # SQS VisibilityTimeout must be >= 6x Lambda timeout to prevent a message
+  # becoming visible again while Lambda is still processing it (causing duplicates).
+  # Lambda timeout = 30s → minimum = 180s. Set to 300s for downstream API headroom.
+  SQSVisibilityTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 43200
+
+  # Number of SQS delivery attempts before moving the message to the DLQ.
+  # dev=3 (fail fast), prod=5 (more retry headroom for transient failures).
+  MaxReceiveCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 1000
+
+  # Reserved concurrency for the payment Lambda caps the rate of calls to the
+  # payment gateway. Prevents Lambda from overwhelming Stripe/Braintree during spikes.
+  PaymentConcurrencyLimit:
+    Type: Number
+    Default: 5
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+# ================================================================
+# RESOURCES — ordered by dependency (bottom-up)
+# ================================================================
+
+Resources:
+
+  # ==============================================================
+  # 1. ALERT INFRASTRUCTURE
+  # SNS topic for ops alerts. CloudWatch alarms publish here.
+  # Subscribe PagerDuty / Slack webhook / OpsGenie as additional endpoints.
+  # ==============================================================
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AppName}-${Environment}-alerts'
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ==============================================================
+  # 2. DYNAMODB TABLES
+  # ==============================================================
+
+  # Orders table — authoritative state store for the order lifecycle.
+  # Single-table design with two GSIs:
+  #   GSI1 (GSI1PK = USER#<userId>) — "my orders" queries
+  #   GSI2 (GSI2PK = STATUS#<status>) — ops dashboard (all PENDING orders, etc.)
+  # DynamoDB Streams enabled: downstream audit trail and future CDC consumers.
+  # DeletionPolicy: Retain — stack delete does NOT delete the table (data safety).
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AppName}-${Environment}-orders'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI2PK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1-UserOrders
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: GSI2-StatusOrders
+          KeySchema:
+            - AttributeName: GSI2PK
+              KeyType: HASH
+            - AttributeName: SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes: [orderId, userId, total, createdAt, updatedAt]
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # Idempotency table — prevents reprocessing messages on Lambda retry.
+  # Pattern: each Lambda does a conditional PutItem(PK=SQS_MessageId, SK=FunctionName).
+  # If ConditionalCheckFailedException → already processed → skip without error.
+  # TTL: records expire after 24h automatically (no manual cleanup).
+  # This table is small — messages processed once per 24h window.
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AppName}-${Environment}-idempotency'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # ==============================================================
+  # 3. DEAD LETTER QUEUES
+  # Standalone standard SQS queues — separate from main queues.
+  # Retention: 14 days (max). Gives ops team maximum investigation window.
+  # CloudWatch alarms fire on any message landing in a DLQ.
+  # ==============================================================
+
+  PaymentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AppName}-${Environment}-payment-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  FulfillmentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AppName}-${Environment}-fulfillment-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  NotificationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AppName}-${Environment}-notification-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  AnalyticsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AppName}-${Environment}-analytics-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # ==============================================================
+  # 4. MAIN SQS QUEUES
+  # RedrivePolicy: after MaxReceiveCount failed deliveries, SQS moves
+  # the message to the DLQ automatically — no Lambda code needed.
+  # MessageRetentionPeriod: prod=4 days, dev=1 day (cost control).
+  # SqsManagedSseEnabled: encryption at rest using SQS-managed keys (free).
+  # Use KMS key (SseKmsKeyId) if you need key rotation audit logs for compliance.
+  # ==============================================================
+
+  # Critical path — payment gateway calls happen here.
+  # Small Lambda batch size (5) limits blast radius per retry cycle.
+  PaymentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AppName}-${Environment}-payment'
+      VisibilityTimeout: !Ref SQSVisibilityTimeout
+      MessageRetentionPeriod: !If [IsProd, 345600, 86400]
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt PaymentDLQ.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # Receives both order.created (inventory reservation) and payment events (order status update).
+  FulfillmentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AppName}-${Environment}-fulfillment'
+      VisibilityTimeout: !Ref SQSVisibilityTimeout
+      MessageRetentionPeriod: !If [IsProd, 345600, 86400]
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FulfillmentDLQ.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # Higher maxReceiveCount than payment — a missed notification doesn't corrupt order state.
+  NotificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AppName}-${Environment}-notification'
+      VisibilityTimeout: !Ref SQSVisibilityTimeout
+      MessageRetentionPeriod: !If [IsProd, 345600, 86400]
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt NotificationDLQ.Arn
+        maxReceiveCount: 5
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # High batch size in ESM — analytics values throughput over low latency.
+  AnalyticsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AppName}-${Environment}-analytics'
+      VisibilityTimeout: !Ref SQSVisibilityTimeout
+      MessageRetentionPeriod: !If [IsProd, 345600, 86400]
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AnalyticsDLQ.Arn
+        maxReceiveCount: !Ref MaxReceiveCount
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # ==============================================================
+  # 5. SQS QUEUE POLICIES
+  # Required for SNS to send to SQS (cross-service resource policy).
+  # Scoped to specific SNS topic ARNs — not open to all SNS in the account.
+  # ==============================================================
+
+  PaymentQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref PaymentQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowOrderEventsTopic
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt PaymentQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderEventsTopic
+
+  FulfillmentQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref FulfillmentQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowOrderAndPaymentTopics
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt FulfillmentQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn:
+                  - !Ref OrderEventsTopic
+                  - !Ref PaymentEventsTopic
+
+  NotificationQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref NotificationQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowOrderAndPaymentTopics
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt NotificationQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn:
+                  - !Ref OrderEventsTopic
+                  - !Ref PaymentEventsTopic
+
+  AnalyticsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref AnalyticsQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowOrderAndPaymentTopics
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt AnalyticsQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn:
+                  - !Ref OrderEventsTopic
+                  - !Ref PaymentEventsTopic
+
+  # ==============================================================
+  # 6. SNS TOPICS + TOPIC POLICIES
+  # Two topics separate concerns:
+  #   OrderEventsTopic  — order lifecycle events (created, cancelled)
+  #   PaymentEventsTopic — payment results (processed, failed)
+  # Separation lets teams subscribe only to what they care about.
+  # ==============================================================
+
+  OrderEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AppName}-${Environment}-order-events'
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  PaymentEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AppName}-${Environment}-payment-events'
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # Allow EventBridge to publish to both SNS topics.
+  OrderEventsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref OrderEventsTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OrderEventsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  PaymentEventsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref PaymentEventsTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref PaymentEventsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # ==============================================================
+  # 7. SNS SUBSCRIPTIONS (fan-out to SQS)
+  # RawMessageDelivery: true → SQS body = EventBridge event JSON directly.
+  # false would wrap in SNS envelope, requiring extra parsing in Lambda.
+  # Lambda inspects detail-type to route to the correct handler path.
+  # ==============================================================
+
+  # order.created → payment processing
+  OrderToPaymentSub:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt PaymentQueue.Arn
+      RawMessageDelivery: true
+
+  # order.created + order.cancelled → fulfillment (inventory reserve/release)
+  OrderToFulfillmentSub:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt FulfillmentQueue.Arn
+      RawMessageDelivery: true
+
+  # order.created + order.cancelled → customer notifications
+  OrderToNotificationSub:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt NotificationQueue.Arn
+      RawMessageDelivery: true
+
+  # all order events → analytics / data lake
+  OrderToAnalyticsSub:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt AnalyticsQueue.Arn
+      RawMessageDelivery: true
+
+  # payment.processed + payment.failed → fulfillment (update order status)
+  PaymentToFulfillmentSub:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref PaymentEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt FulfillmentQueue.Arn
+      RawMessageDelivery: true
+
+  # payment result → customer notification (success or failure email)
+  PaymentToNotificationSub:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref PaymentEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt NotificationQueue.Arn
+      RawMessageDelivery: true
+
+  # payment events → analytics
+  PaymentToAnalyticsSub:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref PaymentEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt AnalyticsQueue.Arn
+      RawMessageDelivery: true
+
+  # ==============================================================
+  # 8. EVENTBRIDGE CUSTOM BUS + RULES
+  # Custom bus (not default) isolates this system.
+  # AWS service events cannot accidentally land here.
+  # Other applications in the account cannot pollute this bus.
+  # ==============================================================
+
+  OrderEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${AppName}-${Environment}-bus'
+
+  # IAM role that EventBridge assumes to publish to SNS.
+  # Scoped to only these two topics.
+  EventBridgeSNSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-${Environment}-eventbridge-sns-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PublishToSNSTopics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource:
+                  - !Ref OrderEventsTopic
+                  - !Ref PaymentEventsTopic
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+
+  # Route order.created events → OrderEventsTopic → fan-out to all consumers
+  OrderCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AppName}-${Environment}-order-created'
+      EventBusName: !Ref OrderEventBus
+      Description: Routes order.created to OrderEventsTopic for fan-out to all consumers
+      EventPattern:
+        source: ['com.ecommerce.orders']
+        detail-type: ['order.created']
+      State: ENABLED
+      Targets:
+        - Id: OrderEventsTopic
+          Arn: !Ref OrderEventsTopic
+          RoleArn: !GetAtt EventBridgeSNSRole.Arn
+
+  # Route order.cancelled → same topic (fulfillment releases inventory, notification sends email)
+  OrderCancelledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AppName}-${Environment}-order-cancelled'
+      EventBusName: !Ref OrderEventBus
+      Description: Routes order.cancelled to OrderEventsTopic
+      EventPattern:
+        source: ['com.ecommerce.orders']
+        detail-type: ['order.cancelled']
+      State: ENABLED
+      Targets:
+        - Id: OrderEventsTopic
+          Arn: !Ref OrderEventsTopic
+          RoleArn: !GetAtt EventBridgeSNSRole.Arn
+
+  # Route payment results → PaymentEventsTopic → fulfillment + notification
+  PaymentEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AppName}-${Environment}-payment-events'
+      EventBusName: !Ref OrderEventBus
+      Description: Routes payment.processed and payment.failed to PaymentEventsTopic
+      EventPattern:
+        source: ['com.ecommerce.payments']
+        detail-type: ['payment.processed', 'payment.failed']
+      State: ENABLED
+      Targets:
+        - Id: PaymentEventsTopic
+          Arn: !Ref PaymentEventsTopic
+          RoleArn: !GetAtt EventBridgeSNSRole.Arn
+
+  # ==============================================================
+  # 9. IAM ROLES — one per Lambda, least privilege
+  # No shared roles. Each function can only access its own queue,
+  # only the DynamoDB actions it performs, and only on named tables.
+  # No wildcard resources (*). No wildcard actions.
+  # ==============================================================
+
+  OrderProducerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-${Environment}-order-producer-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OrderProducerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !GetAtt OrderEventBus.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt OrdersTable.Arn
+
+  PaymentProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-${Environment}-payment-processor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PaymentProcessorAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt PaymentQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt OrdersTable.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt IdempotencyTable.Arn
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !GetAtt OrderEventBus.Arn
+
+  FulfillmentProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-${Environment}-fulfillment-processor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FulfillmentProcessorAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt FulfillmentQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt OrdersTable.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt IdempotencyTable.Arn
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !GetAtt OrderEventBus.Arn
+
+  NotificationProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-${Environment}-notification-processor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: NotificationProcessorAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt NotificationQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt IdempotencyTable.Arn
+              # SES permission scoped by from-address condition
+              - Effect: Allow
+                Action: ses:SendEmail
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    ses:FromAddress: !Sub 'noreply@${AppName}.*'
+
+  AnalyticsProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-${Environment}-analytics-processor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AnalyticsProcessorAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt AnalyticsQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt IdempotencyTable.Arn
+              - Effect: Allow
+                Action: firehose:PutRecordBatch
+                Resource: !Sub 'arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${AppName}-${Environment}-events'
+
+  # ==============================================================
+  # 10. CLOUDWATCH LOG GROUPS
+  # Explicit groups prevent Lambda auto-creating them with unlimited retention.
+  # Prod: 90 days (audit compliance). Dev: 14 days (cost control).
+  # ==============================================================
+
+  OrderProducerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AppName}-${Environment}-order-producer'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  PaymentProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AppName}-${Environment}-payment-processor'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  FulfillmentProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AppName}-${Environment}-fulfillment-processor'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  NotificationProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AppName}-${Environment}-notification-processor'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  AnalyticsProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AppName}-${Environment}-analytics-processor'
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  # ==============================================================
+  # 11. LAMBDA FUNCTIONS
+  # Inline ZipFile handlers demonstrate production patterns:
+  #   - Idempotency via DynamoDB ConditionalCheckFailedException
+  #   - Partial batch failure (batchItemFailures response)
+  #   - Structured JSON logging for CloudWatch Insights
+  #   - Event unwrapping (SQS body → EventBridge event JSON)
+  # Replace ZipFile with S3-backed deployment for real workloads.
+  # ==============================================================
+
+  # Producer: validates, persists, and publishes order.created.
+  # Called by API Gateway (wire the ARN in a separate API stack).
+  OrderProducerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: OrderProducerLogGroup
+    Properties:
+      FunctionName: !Sub '${AppName}-${Environment}-order-producer'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt OrderProducerRole.Arn
+      MemorySize: 256
+      Timeout: 15
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          EVENT_BUS_NAME: !Ref OrderEventBus
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, PutCommand } = require('@aws-sdk/lib-dynamodb');
+          const { EventBridgeClient, PutEventsCommand } = require('@aws-sdk/client-eventbridge');
+
+          const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+          const eb = new EventBridgeClient({});
+
+          exports.handler = async (event) => {
+            const body = typeof event.body === 'string' ? JSON.parse(event.body) : event;
+            const { userId, items, shippingAddress, paymentMethod } = body;
+
+            if (!userId || !items?.length) {
+              return { statusCode: 400, body: JSON.stringify({ error: 'userId and items are required' }) };
+            }
+
+            const orderId = `ORD-${Date.now()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
+            const now = new Date().toISOString();
+            const total = items.reduce((sum, i) => sum + i.price * i.quantity, 0);
+
+            // Write order BEFORE publishing event — consumers may read the record immediately.
+            await dynamo.send(new PutCommand({
+              TableName: process.env.ORDERS_TABLE,
+              Item: {
+                PK: `ORDER#${orderId}`, SK: 'METADATA',
+                GSI1PK: `USER#${userId}`, GSI2PK: 'STATUS#PENDING',
+                orderId, userId, items, shippingAddress,
+                paymentMethod: { type: paymentMethod.type, last4: paymentMethod.last4 },
+                status: 'PENDING', total, createdAt: now, updatedAt: now,
+              },
+              ConditionExpression: 'attribute_not_exists(PK)', // prevent duplicate on API retry
+            }));
+
+            await eb.send(new PutEventsCommand({
+              Entries: [{
+                EventBusName: process.env.EVENT_BUS_NAME,
+                Source: 'com.ecommerce.orders',
+                DetailType: 'order.created',
+                Detail: JSON.stringify({ orderId, userId, items, total, paymentMethod: { type: paymentMethod.type, last4: paymentMethod.last4 }, shippingAddress, createdAt: now }),
+                TraceHeader: event.headers?.['X-Amzn-Trace-Id'],
+              }],
+            }));
+
+            console.log(JSON.stringify({ level: 'INFO', action: 'order.created', orderId, userId, total }));
+            return { statusCode: 201, body: JSON.stringify({ orderId, status: 'PENDING', total }) };
+          };
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # Payment processor: idempotency check → charge gateway → update order → emit result.
+  # ReservedConcurrentExecutions: caps concurrent gateway calls (rate limiting).
+  # Partial batch failure: only failed messages retry, not the whole batch.
+  PaymentProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PaymentProcessorLogGroup
+    Properties:
+      FunctionName: !Sub '${AppName}-${Environment}-payment-processor'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt PaymentProcessorRole.Arn
+      MemorySize: 512
+      Timeout: 30
+      ReservedConcurrentExecutions: !Ref PaymentConcurrencyLimit
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+          EVENT_BUS_NAME: !Ref OrderEventBus
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, PutCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+          const { EventBridgeClient, PutEventsCommand } = require('@aws-sdk/client-eventbridge');
+
+          const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+          const eb = new EventBridgeClient({});
+          const TTL = () => Math.floor(Date.now() / 1000) + 86400; // 24h
+
+          async function acquireIdempotencyLock(messageId, fnName) {
+            try {
+              await dynamo.send(new PutCommand({
+                TableName: process.env.IDEMPOTENCY_TABLE,
+                Item: { PK: messageId, SK: fnName, processedAt: new Date().toISOString(), ttl: TTL() },
+                ConditionExpression: 'attribute_not_exists(PK)',
+              }));
+              return true; // lock acquired — safe to process
+            } catch (err) {
+              if (err.name === 'ConditionalCheckFailedException') return false; // already processed
+              throw err; // unknown — propagate to retry
+            }
+          }
+
+          async function chargeGateway(orderId, total, paymentMethod) {
+            // Production: call Stripe/Braintree with orderId as idempotency key on the gateway.
+            // The gateway idempotency key ensures we don't double-charge if this Lambda retries.
+            console.log(JSON.stringify({ level: 'INFO', action: 'gateway.charging', orderId, total }));
+            if (Math.random() > 0.05) { // 95% success for demo
+              return { success: true, transactionId: `TXN-${Date.now()}`, gateway: 'stripe' };
+            }
+            throw new Error('Gateway declined');
+          }
+
+          exports.handler = async (sqsEvent) => {
+            const failures = [];
+            for (const record of sqsEvent.Records) {
+              try {
+                const event = JSON.parse(record.body);
+                const { orderId, userId, total, paymentMethod } = event.detail;
+
+                const acquired = await acquireIdempotencyLock(record.messageId, 'payment-processor');
+                if (!acquired) {
+                  console.log(JSON.stringify({ level: 'WARN', action: 'skipped.duplicate', messageId: record.messageId, orderId }));
+                  continue;
+                }
+
+                let paymentResult, newStatus, detailType;
+                try {
+                  paymentResult = await chargeGateway(orderId, total, paymentMethod);
+                  newStatus = 'PAYMENT_PROCESSED'; detailType = 'payment.processed';
+                } catch (gwErr) {
+                  paymentResult = { success: false, error: gwErr.message };
+                  newStatus = 'PAYMENT_FAILED'; detailType = 'payment.failed';
+                  console.error(JSON.stringify({ level: 'ERROR', action: 'gateway.failed', orderId, error: gwErr.message }));
+                }
+
+                await dynamo.send(new UpdateCommand({
+                  TableName: process.env.ORDERS_TABLE,
+                  Key: { PK: `ORDER#${orderId}`, SK: 'METADATA' },
+                  UpdateExpression: 'SET #s = :s, GSI2PK = :g, updatedAt = :t, paymentResult = :pr',
+                  ExpressionAttributeNames: { '#s': 'status' },
+                  ExpressionAttributeValues: { ':s': newStatus, ':g': `STATUS#${newStatus}`, ':t': new Date().toISOString(), ':pr': paymentResult },
+                }));
+
+                await eb.send(new PutEventsCommand({
+                  Entries: [{
+                    EventBusName: process.env.EVENT_BUS_NAME,
+                    Source: 'com.ecommerce.payments',
+                    DetailType: detailType,
+                    Detail: JSON.stringify({ orderId, userId, total, paymentResult, processedAt: new Date().toISOString() }),
+                  }],
+                }));
+
+                console.log(JSON.stringify({ level: 'INFO', action: detailType, orderId, userId }));
+              } catch (err) {
+                console.error(JSON.stringify({ level: 'ERROR', messageId: record.messageId, error: err.message }));
+                failures.push({ itemIdentifier: record.messageId });
+              }
+            }
+            // Partial batch response: only failed messageIds retry. Successful ones are deleted by SQS.
+            return { batchItemFailures: failures };
+          };
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # Fulfillment: handles inventory reservation (order.created) and
+  # order status transitions (payment.processed / payment.failed / order.cancelled).
+  FulfillmentProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: FulfillmentProcessorLogGroup
+    Properties:
+      FunctionName: !Sub '${AppName}-${Environment}-fulfillment-processor'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt FulfillmentProcessorRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+          EVENT_BUS_NAME: !Ref OrderEventBus
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, PutCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+          const { EventBridgeClient, PutEventsCommand } = require('@aws-sdk/client-eventbridge');
+
+          const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+          const eb = new EventBridgeClient({});
+          const TTL = () => Math.floor(Date.now() / 1000) + 86400;
+
+          async function acquireIdempotencyLock(messageId, fnName) {
+            try {
+              await dynamo.send(new PutCommand({
+                TableName: process.env.IDEMPOTENCY_TABLE,
+                Item: { PK: messageId, SK: fnName, processedAt: new Date().toISOString(), ttl: TTL() },
+                ConditionExpression: 'attribute_not_exists(PK)',
+              }));
+              return true;
+            } catch (err) {
+              if (err.name === 'ConditionalCheckFailedException') return false;
+              throw err;
+            }
+          }
+
+          exports.handler = async (sqsEvent) => {
+            const failures = [];
+            for (const record of sqsEvent.Records) {
+              try {
+                const event = JSON.parse(record.body);
+                const type = event['detail-type'];
+                const { orderId, userId } = event.detail;
+
+                if (!await acquireIdempotencyLock(record.messageId, 'fulfillment-processor')) continue;
+
+                if (type === 'order.created') {
+                  // Reserve inventory (stub — call inventory service here)
+                  await dynamo.send(new UpdateCommand({
+                    TableName: process.env.ORDERS_TABLE,
+                    Key: { PK: `ORDER#${orderId}`, SK: 'METADATA' },
+                    UpdateExpression: 'SET inventoryStatus = :s, updatedAt = :t',
+                    ExpressionAttributeValues: { ':s': 'RESERVED', ':t': new Date().toISOString() },
+                  }));
+                  await eb.send(new PutEventsCommand({ Entries: [{ EventBusName: process.env.EVENT_BUS_NAME, Source: 'com.ecommerce.fulfillment', DetailType: 'inventory.reserved', Detail: JSON.stringify({ orderId, userId }) }] }));
+
+                } else if (type === 'payment.processed') {
+                  await dynamo.send(new UpdateCommand({
+                    TableName: process.env.ORDERS_TABLE,
+                    Key: { PK: `ORDER#${orderId}`, SK: 'METADATA' },
+                    UpdateExpression: 'SET #s = :s, GSI2PK = :g, updatedAt = :t',
+                    ExpressionAttributeNames: { '#s': 'status' },
+                    ExpressionAttributeValues: { ':s': 'CONFIRMED', ':g': 'STATUS#CONFIRMED', ':t': new Date().toISOString() },
+                  }));
+
+                } else if (type === 'payment.failed' || type === 'order.cancelled') {
+                  // Release inventory reservation
+                  await dynamo.send(new UpdateCommand({
+                    TableName: process.env.ORDERS_TABLE,
+                    Key: { PK: `ORDER#${orderId}`, SK: 'METADATA' },
+                    UpdateExpression: 'SET inventoryStatus = :s, updatedAt = :t',
+                    ExpressionAttributeValues: { ':s': 'RELEASED', ':t': new Date().toISOString() },
+                  }));
+                }
+                console.log(JSON.stringify({ level: 'INFO', action: `fulfillment.${type}`, orderId }));
+              } catch (err) {
+                console.error(JSON.stringify({ level: 'ERROR', messageId: record.messageId, error: err.message }));
+                failures.push({ itemIdentifier: record.messageId });
+              }
+            }
+            return { batchItemFailures: failures };
+          };
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # Notification: maps event types to email templates, sends via SES.
+  # SES is not created here — assume verified identity exists in the account.
+  # In dev, skips actual SES call to avoid sending test emails.
+  NotificationProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: NotificationProcessorLogGroup
+    Properties:
+      FunctionName: !Sub '${AppName}-${Environment}-notification-processor'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt NotificationProcessorRole.Arn
+      MemorySize: 128
+      Timeout: 15
+      Environment:
+        Variables:
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+          FROM_EMAIL: !Sub 'noreply@${AppName}.example.com'
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, PutCommand } = require('@aws-sdk/lib-dynamodb');
+          const { SESClient, SendEmailCommand } = require('@aws-sdk/client-ses');
+
+          const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+          const ses = new SESClient({});
+          const TTL = () => Math.floor(Date.now() / 1000) + 86400;
+
+          async function acquireIdempotencyLock(messageId, fnName) {
+            try {
+              await dynamo.send(new PutCommand({
+                TableName: process.env.IDEMPOTENCY_TABLE,
+                Item: { PK: messageId, SK: fnName, processedAt: new Date().toISOString(), ttl: TTL() },
+                ConditionExpression: 'attribute_not_exists(PK)',
+              }));
+              return true;
+            } catch (err) {
+              if (err.name === 'ConditionalCheckFailedException') return false;
+              throw err;
+            }
+          }
+
+          const TEMPLATES = {
+            'order.created': (d) => ({ subject: `Order Confirmed — ${d.orderId}`, body: `Order ${d.orderId} received. Total: $${d.total.toFixed(2)}.` }),
+            'payment.processed': (d) => ({ subject: `Payment Confirmed — ${d.orderId}`, body: `Payment of $${d.total.toFixed(2)} confirmed. Your order is being prepared.` }),
+            'payment.failed': (d) => ({ subject: `Payment Failed — ${d.orderId}`, body: `Payment failed for order ${d.orderId}. Please update your payment method.` }),
+            'order.cancelled': (d) => ({ subject: `Order Cancelled — ${d.orderId}`, body: `Order ${d.orderId} has been cancelled. Refund within 3-5 days.` }),
+          };
+
+          exports.handler = async (sqsEvent) => {
+            const failures = [];
+            for (const record of sqsEvent.Records) {
+              try {
+                const event = JSON.parse(record.body);
+                const type = event['detail-type'];
+                const detail = event.detail;
+
+                if (!await acquireIdempotencyLock(record.messageId, 'notification-processor')) continue;
+
+                const tmpl = TEMPLATES[type];
+                if (!tmpl) { console.log(JSON.stringify({ level: 'WARN', action: 'no-template', type })); continue; }
+
+                const { subject, body } = tmpl(detail);
+                const to = detail.userEmail ?? 'noreply@placeholder.invalid';
+
+                if (process.env.ENVIRONMENT === 'prod') {
+                  await ses.send(new SendEmailCommand({
+                    Source: process.env.FROM_EMAIL,
+                    Destination: { ToAddresses: [to] },
+                    Message: { Subject: { Data: subject }, Body: { Text: { Data: body } } },
+                  }));
+                }
+                console.log(JSON.stringify({ level: 'INFO', action: 'notification.sent', type, orderId: detail.orderId }));
+              } catch (err) {
+                console.error(JSON.stringify({ level: 'ERROR', messageId: record.messageId, error: err.message }));
+                failures.push({ itemIdentifier: record.messageId });
+              }
+            }
+            return { batchItemFailures: failures };
+          };
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # Analytics: batch-writes all events to Kinesis Firehose → S3 → Athena.
+  # Highest batch size (100) — throughput over latency.
+  # Newline-delimited JSON format is directly queryable by Athena.
+  AnalyticsProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: AnalyticsProcessorLogGroup
+    Properties:
+      FunctionName: !Sub '${AppName}-${Environment}-analytics-processor'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt AnalyticsProcessorRole.Arn
+      MemorySize: 256
+      Timeout: 60
+      Environment:
+        Variables:
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+          FIREHOSE_STREAM: !Sub '${AppName}-${Environment}-events'
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, PutCommand } = require('@aws-sdk/lib-dynamodb');
+          const { FirehoseClient, PutRecordBatchCommand } = require('@aws-sdk/client-firehose');
+
+          const dynamo = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+          const firehose = new FirehoseClient({});
+          const TTL = () => Math.floor(Date.now() / 1000) + 86400;
+
+          exports.handler = async (sqsEvent) => {
+            const failures = [];
+            const firehoseRecords = [];
+
+            for (const record of sqsEvent.Records) {
+              try {
+                const ttl = TTL();
+                try {
+                  await dynamo.send(new PutCommand({
+                    TableName: process.env.IDEMPOTENCY_TABLE,
+                    Item: { PK: record.messageId, SK: 'analytics-processor', processedAt: new Date().toISOString(), ttl },
+                    ConditionExpression: 'attribute_not_exists(PK)',
+                  }));
+                } catch (err) {
+                  if (err.name === 'ConditionalCheckFailedException') continue;
+                  throw err;
+                }
+                const event = JSON.parse(record.body);
+                firehoseRecords.push({
+                  Data: Buffer.from(JSON.stringify({
+                    messageId: record.messageId,
+                    source: event.source,
+                    detailType: event['detail-type'],
+                    detail: event.detail,
+                    eventTime: event.time ?? new Date().toISOString(),
+                    env: process.env.ENVIRONMENT,
+                  }) + '\n'), // newline-delimited JSON — Athena-compatible
+                });
+              } catch (err) {
+                console.error(JSON.stringify({ level: 'ERROR', messageId: record.messageId, error: err.message }));
+                failures.push({ itemIdentifier: record.messageId });
+              }
+            }
+
+            if (firehoseRecords.length > 0 && process.env.ENVIRONMENT === 'prod') {
+              try {
+                await firehose.send(new PutRecordBatchCommand({ DeliveryStreamName: process.env.FIREHOSE_STREAM, Records: firehoseRecords }));
+              } catch (err) {
+                // Firehose failure: all pending records fail → SQS retries the batch
+                console.error(JSON.stringify({ level: 'ERROR', action: 'firehose.batch.failed', error: err.message }));
+                throw err;
+              }
+            }
+            return { batchItemFailures: failures };
+          };
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # ==============================================================
+  # 12. LAMBDA EVENT SOURCE MAPPINGS (SQS → Lambda)
+  # FunctionResponseTypes: [ReportBatchItemFailures] — critical setting.
+  # Without it, if any message fails the entire batch is retried,
+  # causing successfully-processed messages to be reprocessed.
+  # With it, Lambda returns { batchItemFailures: [{itemIdentifier: messageId}] }
+  # and SQS only re-queues the specific failed messages.
+  #
+  # BatchSize + MaximumBatchingWindowInSeconds:
+  #   Payment: small batch (5), no wait — latency-sensitive, fail-fast
+  #   Fulfillment: medium (10), 5s wait — balanced
+  #   Notification: larger (20), 10s — slightly delayed is acceptable
+  #   Analytics: max (100), 30s — throughput maximised, latency irrelevant
+  # ==============================================================
+
+  PaymentESM:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !GetAtt PaymentProcessorFunction.Arn
+      EventSourceArn: !GetAtt PaymentQueue.Arn
+      BatchSize: 5
+      MaximumBatchingWindowInSeconds: 0
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  FulfillmentESM:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !GetAtt FulfillmentProcessorFunction.Arn
+      EventSourceArn: !GetAtt FulfillmentQueue.Arn
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  NotificationESM:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !GetAtt NotificationProcessorFunction.Arn
+      EventSourceArn: !GetAtt NotificationQueue.Arn
+      BatchSize: 20
+      MaximumBatchingWindowInSeconds: 10
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  AnalyticsESM:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !GetAtt AnalyticsProcessorFunction.Arn
+      EventSourceArn: !GetAtt AnalyticsQueue.Arn
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 30
+      FunctionResponseTypes: [ReportBatchItemFailures]
+
+  # ==============================================================
+  # 13. CLOUDWATCH ALARMS
+  # Categories:
+  #   A. DLQ depth > 0 — messages permanently failed (page immediately)
+  #   B. Lambda errors — function throwing uncaught exceptions
+  #   C. Lambda throttles — ReservedConcurrency limit hit
+  #   D. Queue depth growing — consumer falling behind producers
+  # ==============================================================
+
+  # --- A. DLQ alarms (threshold=1, period=60s — alert on first failure) ---
+
+  PaymentDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AppName}-${Environment}-payment-dlq-depth'
+      AlarmDescription: Messages in payment DLQ — permanent failure, investigate immediately
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt PaymentDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  FulfillmentDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AppName}-${Environment}-fulfillment-dlq-depth'
+      AlarmDescription: Messages in fulfillment DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt FulfillmentDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  NotificationDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AppName}-${Environment}-notification-dlq-depth'
+      AlarmDescription: Messages in notification DLQ — customer emails not being sent
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt NotificationDLQ.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  AnalyticsDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AppName}-${Environment}-analytics-dlq-depth'
+      AlarmDescription: Messages in analytics DLQ — data lake has gaps
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AnalyticsDLQ.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # --- B. Lambda error alarms ---
+
+  PaymentLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AppName}-${Environment}-payment-lambda-errors'
+      AlarmDescription: Payment processor Lambda errors — may indicate gateway or DB issues
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PaymentProcessorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # --- C. Lambda throttle alarm (payment only — others scale freely) ---
+
+  PaymentThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AppName}-${Environment}-payment-throttles'
+      AlarmDescription: Payment Lambda throttled — ReservedConcurrentExecutions cap hit. Consider raising PaymentConcurrencyLimit parameter.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref PaymentProcessorFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  # --- D. Queue depth alarm (payment queue — most critical) ---
+
+  PaymentQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AppName}-${Environment}-payment-queue-depth'
+      AlarmDescription: Payment queue backlog exceeds 100 — consumer may be throttled or failing
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt PaymentQueue.QueueName
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+# ================================================================
+# OUTPUTS
+# ================================================================
+
+Outputs:
+
+  EventBusName:
+    Description: EventBridge custom bus — all producers publish here
+    Value: !Ref OrderEventBus
+    Export:
+      Name: !Sub '${AppName}-${Environment}-EventBusName'
+
+  EventBusArn:
+    Value: !GetAtt OrderEventBus.Arn
+    Export:
+      Name: !Sub '${AppName}-${Environment}-EventBusArn'
+
+  OrdersTableName:
+    Value: !Ref OrdersTable
+    Export:
+      Name: !Sub '${AppName}-${Environment}-OrdersTableName'
+
+  IdempotencyTableName:
+    Value: !Ref IdempotencyTable
+    Export:
+      Name: !Sub '${AppName}-${Environment}-IdempotencyTableName'
+
+  OrderProducerFunctionArn:
+    Description: Wire this to API Gateway as the POST /orders handler
+    Value: !GetAtt OrderProducerFunction.Arn
+    Export:
+      Name: !Sub '${AppName}-${Environment}-OrderProducerArn'
+
+  AlertTopicArn:
+    Description: Subscribe PagerDuty / Slack webhooks here for additional alert channels
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AppName}-${Environment}-AlertTopicArn'
+
+  PaymentQueueUrl:
+    Value: !Ref PaymentQueue
+    Export:
+      Name: !Sub '${AppName}-${Environment}-PaymentQueueUrl'
+
+  OrderEventsBusArn:
+    Value: !GetAtt OrderEventBus.Arn

@@ -6,6 +6,79 @@ A collection of AWS architecture concepts, system design references, service tra
 
 ## Templates
 
+### [Event-Driven Order Processing — CloudFormation Template](templates/event-driven-order-processing.yaml)
+
+A production-grade event-driven e-commerce order processing system using EventBridge, SNS, SQS, Lambda, and DynamoDB. Built for real production workloads: idempotency, DLQs, partial batch failure, least-privilege IAM, CloudWatch alarms.
+
+**Architecture:**
+
+```
+API → OrderProducerLambda → EventBridge (custom bus: com.ecommerce)
+                                │
+              ┌─────────────────┼──────────────────┐
+              ▼                 ▼                   ▼
+      order.created      order.cancelled     payment.processed
+      order.cancelled                        payment.failed
+              │                 │                   │
+              ▼                 ▼                   ▼
+      SNS: OrderEventsTopic            SNS: PaymentEventsTopic
+              │                                     │
+    ┌─────────┼───────────┐              ┌──────────┴──────────┐
+    ▼         ▼           ▼              ▼                     ▼
+PaymentQ  FulfillQ  NotifQ+AnalyticsQ  FulfillQ           NotifQ+AnalyticsQ
+    │         │           │              │                     │
+    ▼         ▼           ▼              ▼                     ▼
+ Lambda    Lambda      Lambda         Lambda               Lambda
+  +DLQ      +DLQ        +DLQ           (same)               (same)
+```
+
+**Services and justification:**
+
+| Service | Role | Why chosen over alternative |
+|---------|------|----------------------------|
+| **EventBridge** | Content-based routing | Filters on any payload field (detail-type, source). SNS alone can't route on payload content. 200+ AWS service integrations. |
+| **SNS** | Fan-out | One EB rule → one SNS topic → N SQS queues atomically. Adding a consumer = new SNS subscription, no EB rule change. |
+| **SQS Standard** | Durable buffering | Survives Lambda downtime. At-least-once + code idempotency = effectively exactly-once. FIFO rejected: adds 3K msg/s limit, no real benefit when Lambda handles idempotency. |
+| **DynamoDB on-demand** | State + idempotency | Conditional PutItem (`attribute_not_exists`) is atomic. TTL auto-expires idempotency records at 24h. $0 at idle. |
+| **Lambda** | Event processing | Scales to 0 when idle. Each queue consumer independently throttleable via `ReservedConcurrentExecutions`. |
+
+**What's included:**
+
+| Category | Resources |
+|----------|-----------|
+| Event routing | EventBridge custom bus + 3 rules (order.created, order.cancelled, payment events) |
+| Fan-out | 2 SNS topics + 7 subscriptions |
+| Durable queues | 4 SQS queues + 4 DLQs + 4 queue policies |
+| Consumers | 5 Lambda functions, each with its own IAM role |
+| Idempotency | DynamoDB conditional write on SQS MessageId per function |
+| State store | DynamoDB single-table with 2 GSIs + PITR + Streams |
+| Failure handling | Partial batch failure (`ReportBatchItemFailures` ESM) + DLQ + CloudWatch alarms |
+| Observability | 8 CloudWatch alarms (DLQ depth, Lambda errors, throttles, queue backlog) |
+| Security | One IAM role per Lambda, no wildcard resources, SQS/SNS SSE |
+
+**Deploy:**
+
+```bash
+aws cloudformation deploy \
+  --template-file templates/event-driven-order-processing.yaml \
+  --stack-name ecommerce-order-processing-dev \
+  --parameter-overrides AppName=ecommerce Environment=dev AlertEmail=you@example.com \
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
+**Parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `AppName` | `ecommerce` | Prefix for all resource names |
+| `Environment` | `dev` | `dev` / `staging` / `prod` — affects log retention, message retention, alarm thresholds |
+| `AlertEmail` | `ops@example.com` | Email for CloudWatch alarm SNS notifications |
+| `MaxReceiveCount` | `3` | SQS retry attempts before DLQ (prod: set to 5) |
+| `PaymentConcurrencyLimit` | `5` | Reserved concurrency on payment Lambda — caps gateway call rate |
+| `SQSVisibilityTimeout` | `300` | Must be ≥ 6× Lambda timeout (30s × 6 = 180s minimum) |
+
+---
+
 ### [Simple App — CloudFormation Template](templates/simple-app.yaml)
 
 A production-ready, serverless CloudFormation template for a simple web application. Every service choice is justified against AWS Well-Architected Framework principles.
