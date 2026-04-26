@@ -1,0 +1,656 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Simple web application — serverless, cost-optimized stack.
+  Idle cost: ~$0/month. At 1M API calls/month: ~$5-10.
+  Follows AWS Well-Architected Framework (Cost, Security, Reliability, Performance, Sustainability).
+
+# ================================================================
+# SERVICE JUSTIFICATIONS — Why each service was chosen
+# ================================================================
+#
+# Lambda (not EC2 / Fargate):
+#   Simple apps have unpredictable, bursty traffic.
+#   Lambda costs $0 at idle vs EC2 minimum ~$15/month.
+#   No server patching, OS management, or capacity planning.
+#   Sustainability: zero compute when idle → lower carbon footprint.
+#
+# API Gateway HTTP API (not REST API or ALB):
+#   $1.00/million requests vs $3.50 for REST API (3.5x cheaper).
+#   ~6ms added latency vs ~30ms for REST API.
+#   Native JWT auth via Cognito — no Lambda authorizer needed (saves cost + latency).
+#   Prefer REST API only when you need caching, usage plans, or request transformation.
+#
+# DynamoDB on-demand (not RDS / Aurora):
+#   Simple apps use simple access patterns — lookup by user ID, no JOINs needed.
+#   On-demand mode: pay per request, $0 at idle.
+#   RDS minimum: ~$15/month even empty + patching overhead + Multi-AZ for prod doubles cost.
+#   Point-in-time recovery is free — 35-day backup window included.
+#
+# S3 + CloudFront (not EC2 static hosting):
+#   S3 static hosting: ~$0.023/GB. A typical React build is <10 MB → nearly $0.
+#   CloudFront adds global CDN, HTTPS via ACM (free cert), and Shield Standard
+#   DDoS protection — all for $0.0085/GB egress. First 1 TB/month free (12 months).
+#   EC2 alternative would cost $15-50/month minimum with worse global latency.
+#
+# Cognito User Pool (not custom auth):
+#   Free for up to 50,000 Monthly Active Users.
+#   JWT tokens integrate natively with API Gateway — zero-cost authorization.
+#   MFA, email verification, social login, OIDC out of the box.
+#   Building auth yourself is months of work and a common security failure point.
+#
+# CloudWatch (not third-party APM):
+#   Lambda, API Gateway, DynamoDB emit metrics automatically — no SDK changes.
+#   5 GB logs/month free tier. 30-day retention keeps costs near zero.
+#   Add X-Ray tracing later if latency debugging becomes needed.
+#
+# ================================================================
+
+Parameters:
+
+  AppName:
+    Type: String
+    Default: my-app
+    Description: Lowercase prefix for all resource names (letters, hyphens only)
+    AllowedPattern: '[a-z][a-z0-9-]*'
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+    Description: Deployment environment — affects throttling limits and log retention
+
+  LambdaMemoryMB:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024]
+    Description: >
+      Lambda memory. 256 MB is the sweet spot — ~2x faster than 128 MB for only
+      ~15% more cost per GB-second (Lambda pricing is memory × duration).
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+# ================================================================
+# RESOURCES
+# ================================================================
+
+Resources:
+
+  # --------------------------------------------------------------
+  # IAM — Least Privilege Execution Role
+  # Security pillar: grant only what Lambda actually needs.
+  # No wildcard actions, no wildcard resources.
+  # --------------------------------------------------------------
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AppName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      # AWSLambdaBasicExecutionRole = permission to write to CloudWatch Logs only
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt AppTable.Arn
+                  - !Sub '${AppTable.Arn}/index/*'  # allow GSI queries
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # --------------------------------------------------------------
+  # DynamoDB — Single-table design, on-demand pricing
+  #
+  # Cost:   $0 at idle. $1.25/million writes, $0.25/million reads.
+  # Single-table design: one table covers all entities using PK/SK
+  # patterns (USER#<id>, ITEM#<id>, etc.) — avoids per-table costs.
+  # PITR: free 35-day continuous backup window.
+  # Encryption: AWS-managed key = no extra cost.
+  # DeletionPolicy: Retain — prevents accidental data loss on
+  #                 stack delete (must delete table manually).
+  # --------------------------------------------------------------
+
+  AppTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AppName}-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: PK          # e.g. USER#<userId>
+          AttributeType: S
+        - AttributeName: SK          # e.g. PROFILE, ITEM#<itemId>
+          AttributeType: S
+        - AttributeName: GSI1PK     # e.g. inverted index for secondary queries
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # --------------------------------------------------------------
+  # CloudWatch Log Groups — explicit so retention is controlled
+  #
+  # Without explicit log groups, Lambda auto-creates them with
+  # NEVER EXPIRE retention → surprise storage costs over time.
+  # 30 days keeps recent debugging data; older logs have no value.
+  # --------------------------------------------------------------
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AppName}-${Environment}-api'
+      RetentionInDays: !If [IsProd, 90, 30]
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${AppName}-${Environment}'
+      RetentionInDays: !If [IsProd, 90, 30]
+
+  # --------------------------------------------------------------
+  # Lambda Function — Application logic
+  #
+  # Cost:  First 1M requests/month + 400,000 GB-seconds free forever.
+  # 256 MB / 10s timeout: covers most web API workloads.
+  # Timeout = hard ceiling — prevents runaway costs from hung code.
+  # Throttle (reserved concurrency) not set — uses account pool.
+  # For prod, consider setting ReservedConcurrentExecutions to
+  # cap max spend and prevent noisy-neighbour Lambda starvation.
+  # --------------------------------------------------------------
+
+  AppFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup  # ensure log group exists before Lambda creates it
+    Properties:
+      FunctionName: !Sub '${AppName}-${Environment}-api'
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      MemorySize: !Ref LambdaMemoryMB
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AppTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        # Inline placeholder — replace by deploying a real zip/S3 package.
+        # Use `aws lambda update-function-code` or CodePipeline for CI/CD.
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, GetCommand, PutCommand, QueryCommand } = require('@aws-sdk/lib-dynamodb');
+
+          const client = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+          const TABLE = process.env.TABLE_NAME;
+
+          exports.handler = async (event) => {
+            const { routeKey, pathParameters, body } = event;
+            // JWT claims injected by API Gateway JWT authorizer (no extra code needed)
+            const userId = event.requestContext?.authorizer?.jwt?.claims?.sub;
+
+            try {
+              // GET /health — public, no auth
+              if (routeKey === 'GET /health') {
+                return ok({ status: 'ok', timestamp: new Date().toISOString() });
+              }
+
+              // GET /me — returns authenticated user's profile
+              if (routeKey === 'GET /me') {
+                const result = await client.send(new GetCommand({
+                  TableName: TABLE,
+                  Key: { PK: `USER#${userId}`, SK: 'PROFILE' }
+                }));
+                return ok(result.Item ?? { userId, message: 'Profile not set yet' });
+              }
+
+              // GET /items — list user's items
+              if (routeKey === 'GET /items') {
+                const result = await client.send(new QueryCommand({
+                  TableName: TABLE,
+                  KeyConditionExpression: 'PK = :pk AND begins_with(SK, :prefix)',
+                  ExpressionAttributeValues: { ':pk': `USER#${userId}`, ':prefix': 'ITEM#' }
+                }));
+                return ok({ items: result.Items ?? [] });
+              }
+
+              // POST /items — create a new item
+              if (routeKey === 'POST /items') {
+                const data = JSON.parse(body ?? '{}');
+                const itemId = Date.now().toString();
+                const item = {
+                  PK: `USER#${userId}`,
+                  SK: `ITEM#${itemId}`,
+                  GSI1PK: `ITEM#${itemId}`,
+                  ...data,
+                  createdAt: new Date().toISOString()
+                };
+                await client.send(new PutCommand({ TableName: TABLE, Item: item }));
+                return { statusCode: 201, headers: corsHeaders(), body: JSON.stringify(item) };
+              }
+
+              return { statusCode: 404, headers: corsHeaders(), body: JSON.stringify({ error: 'Route not found' }) };
+
+            } catch (err) {
+              console.error('Handler error:', err);
+              return { statusCode: 500, headers: corsHeaders(), body: JSON.stringify({ error: 'Internal error' }) };
+            }
+          };
+
+          const ok = (data) => ({ statusCode: 200, headers: corsHeaders(), body: JSON.stringify(data) });
+          const corsHeaders = () => ({ 'Content-Type': 'application/json' });
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AppFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+  # --------------------------------------------------------------
+  # Cognito User Pool — Managed authentication
+  #
+  # Cost:  Free up to 50,000 MAU. $0.0055/MAU after that.
+  # SRP auth (ALLOW_USER_SRP_AUTH): password never sent over the
+  # wire — client computes a proof. More secure than USER_PASSWORD_AUTH.
+  # Short access token TTL (60 min) + refresh token (30 days):
+  # balances security (short exposure window) and UX (stay logged in).
+  # --------------------------------------------------------------
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AppName}-${Environment}-users'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      PasswordPolicy:
+        MinimumLength: 8
+        RequireUppercase: true
+        RequireNumbers: true
+        RequireSymbols: false
+        TemporaryPasswordValidityDays: 7
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false  # allow self sign-up
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+      UserPoolTags:
+        App: !Ref AppName
+        Env: !Ref Environment
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${AppName}-${Environment}-web'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false  # public clients (SPA, mobile) cannot keep secrets
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH      # secure remote password — no plaintext password over wire
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED  # prevents email enumeration attacks
+      AccessTokenValidity: 60              # minutes
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30             # days
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # --------------------------------------------------------------
+  # API Gateway HTTP API — Cheapest managed API layer
+  #
+  # Cost:  $1.00/million requests (vs $3.50 for REST API).
+  # CORS: locked to CloudFront domain only — not open wildcard.
+  # Throttle: burst=200 / rate=100 RPS — prevents Lambda runaway
+  #           costs if a client goes haywire (cost control).
+  # JWT authorizer: Cognito validates the token inside API GW —
+  #                 no per-request Lambda authorizer invocation cost.
+  # --------------------------------------------------------------
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AppName}-${Environment}-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !Sub 'https://${CloudFrontDistribution.DomainName}'
+        AllowMethods: [GET, POST, PUT, DELETE, OPTIONS]
+        AllowHeaders: [Content-Type, Authorization]
+        MaxAge: 300
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      Name: CognitoJWT
+      IdentitySource:
+        - '$request.header.Authorization'
+      JwtConfiguration:
+        Audience:
+          - !Ref UserPoolClient
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AppFunction.Arn
+      PayloadFormatVersion: '2.0'  # V2 is smaller payload, faster than V1
+
+  # Public route — health check, no auth
+  RouteHealth:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /health'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  # Protected routes — require valid Cognito JWT
+  RouteGetMe:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /me'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  RouteGetItems:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /items'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  RoutePostItems:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /items'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: !If [IsProd, 500, 200]
+        ThrottlingRateLimit: !If [IsProd, 200, 100]
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiLogGroup.Arn
+
+  # --------------------------------------------------------------
+  # S3 — Private bucket for static frontend
+  #
+  # Cost:  ~$0.023/GB. A 10 MB React build = $0.0002/month.
+  # Security: fully private — CloudFront uses OAC (SigV4) to read.
+  #           No public access, no ACLs, no website hosting endpoint.
+  # Versioning: enabled so you can roll back a bad frontend deploy
+  #             by pointing CloudFront at a previous version.
+  # --------------------------------------------------------------
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AppName}-${Environment}-frontend-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # --------------------------------------------------------------
+  # CloudFront — CDN, HTTPS termination, DDoS protection
+  #
+  # Cost:  $0.0085/GB (first 10 TB). First 1 TB + 10M requests free (12 months).
+  # OAC:   Origin Access Control (SigV4) — modern replacement for OAI.
+  #         S3 bucket stays fully private; only CloudFront can read it.
+  # HTTP/3 (QUIC): enabled — reduces latency on mobile/lossy networks at no cost.
+  # Two origins:
+  #   - S3 (default)  → static frontend assets, long cache TTL
+  #   - API Gateway   → /api/* path, no caching
+  # SPA routing: returns index.html for 403/404 so React Router handles URLs.
+  # Shield Standard: automatically included with CloudFront — free DDoS L3/L4.
+  # --------------------------------------------------------------
+
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AppName}-${Environment}-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${AppName} ${Environment}'
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !If
+          - IsProd
+          - PriceClass_All        # all edge locations globally (prod)
+          - PriceClass_100        # US + EU only (dev — cheaper, still fast enough)
+
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+
+          - Id: ApiOrigin
+            DomainName: !Sub '${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+
+        # Default: serve frontend from S3 with long cache TTL
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          # CachingOptimized (AWS managed policy) — cache based on nothing, max TTL 1 year
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          AllowedMethods: [GET, HEAD]
+          Compress: true
+
+        # /api/* → API Gateway — never cache API responses at edge
+        CacheBehaviors:
+          - PathPattern: '/api/*'
+            TargetOriginId: ApiOrigin
+            ViewerProtocolPolicy: https-only
+            # CachingDisabled (AWS managed policy)
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            # AllViewerExceptHostHeader — forward all headers/cookies except Host
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+
+        # SPA: return index.html for 403 (private S3) and 404, let React Router handle routing
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+      Tags:
+        - Key: App
+          Value: !Ref AppName
+        - Key: Env
+          Value: !Ref Environment
+
+  # --------------------------------------------------------------
+  # CloudWatch Alarm — Error rate guardrail
+  #
+  # Alerts if Lambda throws 5+ errors in a 5-minute window.
+  # No SNS topic created here (add one if you want email/PagerDuty).
+  # TreatMissingData: notBreaching — Lambda scale-to-zero produces
+  # zero metrics, not missing data that would false-alarm.
+  # --------------------------------------------------------------
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AppName}-${Environment}-lambda-errors'
+      AlarmDescription: Lambda threw 5+ errors in 5 minutes
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AppFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  ApiLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AppName}-${Environment}-api-latency'
+      AlarmDescription: API p99 latency exceeded 3 seconds
+      Namespace: AWS/ApiGateway
+      MetricName: IntegrationLatency
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref HttpApi
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 3000  # milliseconds
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# ================================================================
+# OUTPUTS
+# ================================================================
+
+Outputs:
+
+  AppUrl:
+    Description: Public URL of your application
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AppName}-${Environment}-AppUrl'
+
+  ApiEndpoint:
+    Description: API Gateway base URL (routed via CloudFront at /api/*)
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub '${AppName}-${Environment}-ApiEndpoint'
+
+  UserPoolId:
+    Description: Cognito User Pool ID — configure in your frontend auth SDK
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${AppName}-${Environment}-UserPoolId'
+
+  UserPoolClientId:
+    Description: Cognito App Client ID — configure in your frontend auth SDK
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub '${AppName}-${Environment}-UserPoolClientId'
+
+  DynamoTableName:
+    Description: DynamoDB table name
+    Value: !Ref AppTable
+    Export:
+      Name: !Sub '${AppName}-${Environment}-TableName'
+
+  FrontendBucket:
+    Description: S3 bucket — sync your build output here to deploy
+    Value: !Ref FrontendBucket
+    Export:
+      Name: !Sub '${AppName}-${Environment}-FrontendBucket'

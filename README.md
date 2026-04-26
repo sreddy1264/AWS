@@ -1,6 +1,88 @@
 # AWS
 
-A collection of AWS architecture concepts, system design references, and service trade-off guides.
+A collection of AWS architecture concepts, system design references, service trade-off guides, and deployable CloudFormation templates.
+
+---
+
+## Templates
+
+### [Simple App — CloudFormation Template](templates/simple-app.yaml)
+
+A production-ready, serverless CloudFormation template for a simple web application. Every service choice is justified against AWS Well-Architected Framework principles.
+
+**Architecture:**
+
+```
+Browser → CloudFront (CDN + HTTPS + DDoS)
+            ├── /          → S3 (static frontend / React SPA)
+            └── /api/*     → API Gateway HTTP API → Lambda → DynamoDB
+                                    ↑
+                              Cognito JWT auth (API GW validates — no extra Lambda call)
+```
+
+**Services and justification:**
+
+| Service | Why chosen | Idle cost |
+|---------|-----------|-----------|
+| **Lambda** | Bursty/unpredictable traffic — pay per invocation, zero idle cost vs EC2 ~$15/month minimum | $0 |
+| **API Gateway HTTP API** | $1/million requests (3.5× cheaper than REST API), 6ms overhead vs 30ms, native JWT auth | $0 |
+| **DynamoDB on-demand** | Simple key-value access patterns, no JOINs needed, scales to zero, PITR free | $0 |
+| **S3 + CloudFront** | ~$0/month for a 10 MB SPA bundle; global CDN + free HTTPS + Shield Standard DDoS | ~$0 |
+| **Cognito User Pool** | Free up to 50K MAU; JWT integrates natively with API Gateway; no auth code to maintain | $0 |
+| **CloudWatch** | Native metrics/logs from all services; 5 GB/month free tier; 30-day retention auto-purge | $0 |
+
+**Estimated cost at scale:**
+
+| Traffic | Estimated monthly cost |
+|---------|----------------------|
+| Idle / dev | ~$0 |
+| 100K API calls | ~$0.10 |
+| 1M API calls | ~$5–10 |
+| 10M API calls | ~$40–60 |
+
+**Deploy:**
+
+```bash
+# Create stack
+aws cloudformation deploy \
+  --template-file templates/simple-app.yaml \
+  --stack-name my-app-dev \
+  --parameter-overrides AppName=my-app Environment=dev \
+  --capabilities CAPABILITY_NAMED_IAM
+
+# Deploy frontend (after building your React/Vue/etc app)
+aws s3 sync ./dist s3://$(aws cloudformation describe-stacks \
+  --stack-name my-app-dev \
+  --query 'Stacks[0].Outputs[?OutputKey==`FrontendBucket`].OutputValue' \
+  --output text) --delete
+
+# Invalidate CloudFront cache
+aws cloudfront create-invalidation \
+  --distribution-id $(aws cloudformation describe-stacks \
+    --stack-name my-app-dev \
+    --query 'Stacks[0].Outputs[?OutputKey==`AppUrl`].OutputValue' \
+    --output text | cut -d/ -f3) \
+  --paths "/*"
+```
+
+**Parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `AppName` | `my-app` | Prefix for all resource names |
+| `Environment` | `dev` | `dev` or `prod` — affects throttle limits, log retention, CloudFront price class |
+| `LambdaMemoryMB` | `256` | 128 / 256 / 512 / 1024 MB |
+
+**What's included in the template:**
+- IAM role with least-privilege DynamoDB access (no wildcards)
+- DynamoDB single-table design with GSI, PITR, and encryption at rest
+- Lambda with inline placeholder handler (replace with your code)
+- API Gateway HTTP API with Cognito JWT authorizer
+- Public `/health` route + protected `/me`, `/items` routes
+- S3 private bucket with Origin Access Control (OAC) for CloudFront
+- CloudFront with two origins (S3 for frontend, API GW for `/api/*`)
+- SPA routing: 403/404 → `index.html` so React Router handles URLs
+- CloudWatch alarms: Lambda error rate and API p99 latency
 
 ---
 
